@@ -1,80 +1,156 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quickstart
+description: Run the Example Voting App locally in under 5 minutes using Docker Compose.
 ---
 
-## Get started in three steps
+This guide gets the full five-service voting stack running on your machine. You will cast a vote, watch it flow through Redis and the .NET worker, and see live results update in your browser.
 
-Get your documentation site running locally and make your first customization.
+## Prerequisites
 
-### Step 1: Set up your local environment
+<Tabs>
+  <Tab title="Mac / Windows">
+    Install [Docker Desktop](https://www.docker.com/products/docker-desktop). Docker Compose is bundled and enabled by default — no extra steps required.
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+    Verify your installation:
 
-### Step 2: Deploy your changes
+    ```bash
+    docker --version
+    docker compose version
+    ```
+  </Tab>
+  <Tab title="Linux">
+    Install Docker Engine and the Compose plugin separately.
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+    ```bash
+    # Install Docker Engine (Ubuntu/Debian)
+    sudo apt-get update
+    sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    ```
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+    Add your user to the `docker` group so you can run commands without `sudo`:
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+    ```bash
+    sudo usermod -aG docker $USER
+    newgrp docker
+    ```
 
-### Step 3: Go live
+    Verify your installation:
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    ```bash
+    docker --version
+    docker compose version
+    ```
 
-## Next steps
+    <Info>
+      The Compose plugin ships as `docker compose` (with a space). The legacy standalone `docker-compose` binary is not required.
+    </Info>
+  </Tab>
+</Tabs>
 
-Now that you have your docs running, explore these key features:
+## Run the app
 
-<CardGroup cols={2}>
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/dockersamples/example-voting-app.git
+    cd example-voting-app
+    ```
+  </Step>
 
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
+  <Step title="Start all services">
+    Build the images and start every container in the foreground:
 
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
+    ```bash
+    docker compose up
+    ```
 
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
+    Docker Compose will build three images (`vote`, `result`, `worker`) and pull two official images (`redis:alpine`, `postgres:15-alpine`). The first run takes a few minutes; subsequent starts are fast because the layers are cached.
 
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
+    You will see interleaved log output from all five services. The stack is ready when you see lines similar to:
 
-</CardGroup>
+    ```
+    vote-1    |  * Running on http://0.0.0.0:80
+    result-1  | App running on port 4000
+    worker-1  | Connected to db
+    worker-1  | Connecting to redis
+    ```
+
+    <Info>
+      The `worker` service retries its Redis and Postgres connections until they pass their health checks. Brief `Waiting for db` or `Waiting for redis` messages during startup are normal.
+    </Info>
+  </Step>
+
+  <Step title="Open the voting and results pages">
+    With the stack running, open two browser tabs:
+
+    | Service | URL | Description |
+    |---------|-----|-------------|
+    | Vote | [http://localhost:8080](http://localhost:8080) | Cast a vote for Cats or Dogs |
+    | Results | [http://localhost:8081](http://localhost:8081) | Watch live vote totals update |
+
+    Click **Cats** or **Dogs** on the vote page. Switch to the results tab — the count updates within about one second as the .NET worker processes the message from Redis and writes it to Postgres.
+  </Step>
+
+  <Step title="(Optional) Seed the database with test votes">
+    To pre-populate the database with a batch of votes, start the `seed` service using the `seed` profile. This service is excluded from the default `up` command and runs once then exits.
+
+    ```bash
+    docker compose --profile seed up -d
+    ```
+
+    The seed container submits votes against the `vote` service's HTTP endpoint and terminates automatically after it finishes. Check the results page to see the seeded totals.
+  </Step>
+
+  <Step title="Stop the app">
+    Press `Ctrl+C` in the terminal where `docker compose up` is running, then remove the containers and network:
+
+    ```bash
+    docker compose down
+    ```
+
+    This stops and removes the containers but preserves the `db-data` named volume so your votes survive a restart. To remove the volume as well:
+
+    ```bash
+    docker compose down --volumes
+    ```
+  </Step>
+</Steps>
+
+## How voting works
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+  The vote app tracks voters by a `voter_id` cookie set in the browser. Each browser (or browser profile) counts as one voter — submitting multiple votes from the same browser only updates your existing vote rather than adding a new one. To simulate multiple distinct voters, open the vote page in different browsers or use private/incognito windows.
 </Note>
+
+When you click a vote button, the Python Flask app (`vote/app.py`) pushes a JSON message to the `votes` Redis list:
+
+```json
+{"voter_id": "<hex-id-from-cookie>", "vote": "a"}
+```
+
+The .NET worker (`worker/Program.cs`) polls the `votes` list every 100 ms, dequeues each message, and upserts a row into the `votes` table in Postgres:
+
+```sql
+INSERT INTO votes (id, vote) VALUES (@id, @vote)
+-- or, if the voter_id already exists:
+UPDATE votes SET vote = @vote WHERE id = @id
+```
+
+The Node.js result server (`result/server.js`) queries Postgres once per second and broadcasts the totals to every connected browser over Socket.IO, so the results page updates in real time without polling.
+
+## What's next
+
+<CardGroup cols={2}>
+  <Card title="Architecture overview" icon="sitemap" href="/architecture/overview">
+    Understand how the five services connect and what each technology is responsible for.
+  </Card>
+  <Card title="Deploy to Docker Swarm" icon="layer-group" href="/deployment/docker-swarm">
+    Run the app in production mode with replicated services using `docker stack deploy`.
+  </Card>
+  <Card title="Deploy to Kubernetes" icon="helm" href="/deployment/kubernetes">
+    Apply the included Kubernetes manifests to run the app on any cluster.
+  </Card>
+  <Card title="Configuration" icon="sliders" href="/operations/configuration">
+    Change the vote choices from Cats vs Dogs to anything you like using environment variables.
+  </Card>
+</CardGroup>

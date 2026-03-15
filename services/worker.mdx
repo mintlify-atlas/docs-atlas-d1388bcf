@@ -1,0 +1,173 @@
+---
+title: Worker
+description: Asynchronous vote processor that bridges Redis and PostgreSQL.
+---
+
+The worker service has no HTTP interface. It runs a continuous background loop that dequeues vote messages from Redis and writes them to PostgreSQL, acting as the bridge between the stateless vote front-end and the persistent database.
+
+## Technology
+
+| Component | Version |
+|---|---|
+| .NET runtime | 7.0 |
+| Npgsql | 4.1.9 |
+| StackExchange.Redis | 2.2.4 |
+| Newtonsoft.Json | 13.0.1 |
+
+## Network
+
+The worker is attached to the **back-tier** network only. It has no exposed ports and is not accessible from the host machine or the front-tier network. All communication is internal between containers.
+
+## Startup sequence
+
+<Steps>
+  <Step title="Connect to PostgreSQL">
+    `OpenDbConnection` retries indefinitely (sleeping 1 second between attempts) until the database accepts a connection. Once connected, it creates the `votes` table if it does not already exist:
+
+    ```csharp Program.cs
+    var command = connection.CreateCommand();
+    command.CommandText = @"CREATE TABLE IF NOT EXISTS votes (
+                                id VARCHAR(255) NOT NULL UNIQUE,
+                                vote VARCHAR(255) NOT NULL
+                            )";
+    command.ExecuteNonQuery();
+    ```
+  </Step>
+  <Step title="Connect to Redis">
+    `OpenRedisConnection` resolves the `redis` hostname to an IP address first (working around a StackExchange.Redis DNS issue), then retries connection until successful.
+  </Step>
+  <Step title="Enter the processing loop">
+    The main loop polls Redis every 100 ms and processes any available messages.
+  </Step>
+</Steps>
+
+## Processing loop
+
+The core loop runs indefinitely, sleeping 100 ms between iterations to avoid spinning the CPU:
+
+```csharp Program.cs
+var definition = new { vote = "", voter_id = "" };
+while (true)
+{
+    // Slow down to prevent CPU spike, only query each 100ms
+    Thread.Sleep(100);
+
+    // Reconnect redis if down
+    if (redisConn == null || !redisConn.IsConnected) {
+        Console.WriteLine("Reconnecting Redis");
+        redisConn = OpenRedisConnection("redis");
+        redis = redisConn.GetDatabase();
+    }
+    string json = redis.ListLeftPopAsync("votes").Result;
+    if (json != null)
+    {
+        var vote = JsonConvert.DeserializeAnonymousType(json, definition);
+        Console.WriteLine($"Processing vote for '{vote.vote}' by '{vote.voter_id}'");
+        // Reconnect DB if down
+        if (!pgsql.State.Equals(System.Data.ConnectionState.Open))
+        {
+            Console.WriteLine("Reconnecting DB");
+            pgsql = OpenDbConnection("Server=db;Username=postgres;Password=postgres;");
+        }
+        else
+        { // Normal +1 vote requested
+            UpdateVote(pgsql, vote.voter_id, vote.vote);
+        }
+    }
+    else
+    {
+        keepAliveCommand.ExecuteNonQuery();
+    }
+}
+```
+
+When there is no message in the queue, the loop executes a `SELECT 1` keep-alive query against PostgreSQL. This works around the absence of native TCP keep-alive support in Npgsql and prevents the connection from being dropped by idle timeouts.
+
+## Upsert logic
+
+Each voter can only have one vote recorded. The `UpdateVote` method attempts an `INSERT` first. If the voter ID already exists (due to the `UNIQUE` constraint), it falls back to an `UPDATE`:
+
+```csharp Program.cs
+private static void UpdateVote(NpgsqlConnection connection, string voterId, string vote)
+{
+    var command = connection.CreateCommand();
+    try
+    {
+        command.CommandText = "INSERT INTO votes (id, vote) VALUES (@id, @vote)";
+        command.Parameters.AddWithValue("@id", voterId);
+        command.Parameters.AddWithValue("@vote", vote);
+        command.ExecuteNonQuery();
+    }
+    catch (DbException)
+    {
+        command.CommandText = "UPDATE votes SET vote = @vote WHERE id = @id";
+        command.ExecuteNonQuery();
+    }
+    finally
+    {
+        command.Dispose();
+    }
+}
+```
+
+This means a voter who changes their selection will have their row updated rather than a second row inserted. The total count per option always reflects the latest choice per voter.
+
+## Database schema
+
+```sql
+CREATE TABLE IF NOT EXISTS votes (
+    id   VARCHAR(255) NOT NULL UNIQUE,
+    vote VARCHAR(255) NOT NULL
+);
+```
+
+| Column | Type | Constraint | Description |
+|---|---|---|---|
+| `id` | `VARCHAR(255)` | `NOT NULL UNIQUE` | Voter ID (hex string from the vote service cookie) |
+| `vote` | `VARCHAR(255)` | `NOT NULL` | The selected option (`a` or `b`) |
+
+## Reconnection handling
+
+<AccordionGroup>
+  <Accordion title="Redis reconnection">
+    On each loop iteration, the worker checks `redisConn.IsConnected`. If the connection has been lost, it calls `OpenRedisConnection` again, which retries until a new connection is established.
+  </Accordion>
+  <Accordion title="PostgreSQL reconnection">
+    Before processing a vote, the worker checks `pgsql.State`. If the connection is not `Open`, it calls `OpenDbConnection` again. The table creation step runs again on reconnect, but the `IF NOT EXISTS` guard makes this safe.
+  </Accordion>
+</AccordionGroup>
+
+## Dockerfile
+
+The Dockerfile uses a two-stage build to keep the final image small:
+
+```dockerfile Dockerfile
+# build compiles the program for the builder's local platform
+FROM --platform=${BUILDPLATFORM} mcr.microsoft.com/dotnet/sdk:7.0 AS build
+ARG TARGETPLATFORM
+ARG TARGETARCH
+ARG BUILDPLATFORM
+
+WORKDIR /source
+COPY *.csproj .
+RUN dotnet restore -a $TARGETARCH
+
+COPY . .
+RUN dotnet publish -c release -o /app -a $TARGETARCH --self-contained false --no-restore
+
+# app image
+FROM mcr.microsoft.com/dotnet/runtime:7.0
+WORKDIR /app
+COPY --from=build /app .
+ENTRYPOINT ["dotnet", "Worker.dll"]
+```
+
+The `--platform=${BUILDPLATFORM}` flag on the build stage ensures the SDK always runs natively on the build machine. The `$TARGETARCH` argument is passed to `dotnet restore` and `dotnet publish` to cross-compile the output for the target architecture.
+
+<Note>
+  To build for a different architecture than your host (for example, building for `linux/arm64` on an Intel machine), pass `--platform` to `docker buildx build`:
+
+  ```bash
+  docker buildx build --platform linux/arm64/v8 ./worker
+  ```
+</Note>

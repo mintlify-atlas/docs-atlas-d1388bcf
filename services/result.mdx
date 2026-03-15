@@ -1,0 +1,180 @@
+---
+title: Result
+description: Real-time results dashboard built with Node.js and Socket.IO.
+---
+
+The result service is the public-facing web application that displays live vote tallies. It polls PostgreSQL every second and pushes updated scores to all connected browsers via Socket.IO, with no page reload required.
+
+## Technology
+
+| Component | Version |
+|---|---|
+| Node.js | 18-slim |
+| Express | ^4.18.2 |
+| Socket.IO | ^4.7.2 |
+| pg (PostgreSQL client) | ^8.8.0 |
+| async | ^3.1.0 |
+| cookie-parser | ^1.4.6 |
+
+## Port mapping
+
+| Scope | Port | Purpose |
+|---|---|---|
+| Container (internal) | `80` | HTTP + WebSocket traffic |
+| Host (external) | `8081` | Results UI |
+| Host (loopback only) | `9229` | Node.js inspector (debug) |
+
+Access the results dashboard at [http://localhost:8081](http://localhost:8081) when running locally. The debug port is bound to `127.0.0.1` only and is not accessible remotely.
+
+## How it works
+
+<Steps>
+  <Step title="Connect to PostgreSQL">
+    On startup, the service uses `async.retry` to establish a database connection, retrying up to 1000 times at 1-second intervals. This handles the race condition where the database container may not be ready immediately.
+
+    ```javascript server.js
+    async.retry(
+      {times: 1000, interval: 1000},
+      function(callback) {
+        pool.connect(function(err, client, done) {
+          if (err) {
+            console.error("Waiting for db");
+          }
+          callback(err, client);
+        });
+      },
+      function(err, client) {
+        if (err) {
+          return console.error("Giving up");
+        }
+        console.log("Connected to db");
+        getVotes(client);
+      }
+    );
+    ```
+  </Step>
+  <Step title="Poll the database">
+    Once connected, `getVotes` runs a SQL query and schedules itself to run again after 1 second — creating a continuous polling loop.
+
+    ```javascript server.js
+    function getVotes(client) {
+      client.query('SELECT vote, COUNT(id) AS count FROM votes GROUP BY vote', [], function(err, result) {
+        if (err) {
+          console.error("Error performing query: " + err);
+        } else {
+          var votes = collectVotesFromResult(result);
+          io.sockets.emit("scores", JSON.stringify(votes));
+        }
+
+        setTimeout(function() {getVotes(client) }, 1000);
+      });
+    }
+    ```
+  </Step>
+  <Step title="Broadcast scores via Socket.IO">
+    After each query, the aggregated scores are emitted to all connected Socket.IO clients as a `scores` event. The browser-side JavaScript listens for this event and updates the DOM.
+  </Step>
+</Steps>
+
+## SQL query
+
+Votes are aggregated directly in the database. The query groups by the `vote` column and counts rows per option:
+
+```sql
+SELECT vote, COUNT(id) AS count FROM votes GROUP BY vote
+```
+
+The result is normalized into a fixed-shape object before being broadcast:
+
+```javascript server.js
+function collectVotesFromResult(result) {
+  var votes = {a: 0, b: 0};
+
+  result.rows.forEach(function (row) {
+    votes[row.vote] = parseInt(row.count);
+  });
+
+  return votes;
+}
+```
+
+## WebSocket events
+
+<Tabs>
+  <Tab title="Server → Client">
+    | Event | Payload | Description |
+    |---|---|---|
+    | `message` | `{ text: 'Welcome!' }` | Sent immediately on connection |
+    | `scores` | `{"a": <count>, "b": <count>}` | Emitted every ~1 second with current totals |
+  </Tab>
+  <Tab title="Client → Server">
+    | Event | Payload | Description |
+    |---|---|---|
+    | `subscribe` | `{ channel: <name> }` | Joins a named Socket.IO room |
+  </Tab>
+</Tabs>
+
+Example `scores` payload:
+
+```json
+{"a": 142, "b": 89}
+```
+
+## Database connection
+
+The service connects using the `pg` connection pool with a hardcoded connection string:
+
+```javascript server.js
+var pool = new Pool({
+  connectionString: 'postgres://postgres:postgres@db/postgres'
+});
+```
+
+The hostname `db` resolves to the PostgreSQL container via the shared `back-tier` Docker network.
+
+## HTTP endpoint
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/` | Serves `views/index.html` — the results page that opens a Socket.IO connection |
+
+Static assets (CSS, JavaScript) are served from the `views/` directory.
+
+## Networks
+
+The result service is attached to both Docker networks:
+
+- **front-tier** — accessible from the host machine
+- **back-tier** — allows communication with the PostgreSQL (`db`) service
+
+## Dockerfile
+
+The service uses a single-stage build from `node:18-slim`:
+
+```dockerfile Dockerfile
+FROM node:18-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl tini && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /usr/local/app
+
+RUN npm install -g nodemon
+
+COPY package*.json ./
+
+RUN npm ci && \
+ npm cache clean --force && \
+ mv /usr/local/app/node_modules /node_modules
+
+COPY . .
+
+ENV PORT=80
+EXPOSE 80
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["node", "server.js"]
+```
+
+`tini` is used as PID 1 to ensure proper signal handling and zombie process reaping. In the `docker-compose.yml` development setup, the entrypoint is overridden to use `nodemon --inspect=0.0.0.0 server.js` for live reloading and remote debugging.

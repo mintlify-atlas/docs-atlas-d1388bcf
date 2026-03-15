@@ -1,0 +1,138 @@
+---
+title: PostgreSQL
+description: Persistent relational database that stores the canonical vote records.
+---
+
+PostgreSQL is the durable storage layer for the application. The worker service writes vote records here, and the result service reads from it to compute live tallies. Data persists across container restarts via a named Docker volume.
+
+## Image
+
+```
+postgres:15-alpine
+```
+
+## Default credentials
+
+| Variable | Value |
+|---|---|
+| `POSTGRES_USER` | `postgres` |
+| `POSTGRES_PASSWORD` | `postgres` |
+| Database name | `postgres` (default, created automatically) |
+
+<Warning>
+  The default username and password (`postgres` / `postgres`) are hardcoded in `docker-compose.yml` and in the worker and result service source code. These credentials are not suitable for any environment beyond local development. For staging or production deployments, use secrets management and set strong, unique credentials via environment variables.
+</Warning>
+
+## Volume
+
+Database files are stored in a named Docker volume to survive container restarts:
+
+```yaml docker-compose.yml
+volumes:
+  - "db-data:/var/lib/postgresql/data"
+```
+
+The `db-data` volume is declared at the top level of `docker-compose.yml`:
+
+```yaml docker-compose.yml
+volumes:
+  db-data:
+```
+
+Docker creates and manages this volume automatically. Unlike a bind mount, the volume is not tied to a specific path on the host filesystem.
+
+## Database schema
+
+The worker service creates the `votes` table on its first successful connection. The `IF NOT EXISTS` guard makes this idempotent:
+
+```sql
+CREATE TABLE IF NOT EXISTS votes (
+    id   VARCHAR(255) NOT NULL UNIQUE,
+    vote VARCHAR(255) NOT NULL
+);
+```
+
+| Column | Type | Constraint | Description |
+|---|---|---|---|
+| `id` | `VARCHAR(255)` | `NOT NULL UNIQUE` | Voter ID — one row per browser session |
+| `vote` | `VARCHAR(255)` | `NOT NULL` | The selected option: `a` or `b` |
+
+The `UNIQUE` constraint on `id` enforces one vote per voter. The worker uses an INSERT-then-UPDATE pattern so that changing a vote updates the existing row rather than inserting a duplicate.
+
+## Connection strings
+
+<Tabs>
+  <Tab title="Worker (.NET)">
+    ```csharp
+    Server=db;Username=postgres;Password=postgres;
+    ```
+
+    Used by Npgsql in `Program.cs`. The hostname `db` resolves to the PostgreSQL container over the `back-tier` network.
+  </Tab>
+  <Tab title="Result (Node.js)">
+    ```javascript
+    postgres://postgres:postgres@db/postgres
+    ```
+
+    Used by the `pg` connection pool in `server.js`. The path component `/postgres` specifies the database name.
+  </Tab>
+</Tabs>
+
+## Health check
+
+PostgreSQL uses a shell script mounted from the host to verify it is accepting queries:
+
+```yaml docker-compose.yml
+healthcheck:
+  test: /healthchecks/postgres.sh
+  interval: "5s"
+```
+
+The script runs `SELECT 1` via `psql` over a TCP connection (bypassing the local Unix socket) to confirm external connectivity:
+
+```bash healthchecks/postgres.sh
+#!/bin/bash
+set -eo pipefail
+
+host="$(hostname -i || echo '127.0.0.1')"
+user="${POSTGRES_USER:-postgres}"
+db="${POSTGRES_DB:-$POSTGRES_USER}"
+export PGPASSWORD="${POSTGRES_PASSWORD:-}"
+
+args=(
+	--host "$host"
+	--username "$user"
+	--dbname "$db"
+	--quiet --no-align --tuples-only
+)
+
+if select="$(echo 'SELECT 1' | psql "${args[@]}")" && [ "$select" = '1' ]; then
+	exit 0
+fi
+
+exit 1
+```
+
+Both the worker service and the result service declare `condition: service_healthy` on `db`, so Docker will not start them until this check passes.
+
+## Network
+
+PostgreSQL is attached to the **back-tier** network only. It has no exposed ports and is not reachable from the host machine or the front-tier network. Only the worker and result containers can connect to it, using the hostname `db`.
+
+## Compose configuration
+
+```yaml docker-compose.yml
+db:
+  image: postgres:15-alpine
+  environment:
+    POSTGRES_USER: "postgres"
+    POSTGRES_PASSWORD: "postgres"
+  volumes:
+    - "db-data:/var/lib/postgresql/data"
+    - "./healthchecks:/healthchecks"
+  healthcheck:
+    test: /healthchecks/postgres.sh
+    interval: "5s"
+  networks:
+    - back-tier
+```

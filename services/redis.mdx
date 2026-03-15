@@ -1,0 +1,89 @@
+---
+title: Redis
+description: In-memory message queue that connects the vote and worker services.
+---
+
+Redis serves as the message queue between the vote front-end and the worker. The vote service appends vote messages to a Redis list, and the worker consumes them from the other end. Redis does not store data to disk in this configuration.
+
+## Image
+
+```
+redis:alpine
+```
+
+## Queue pattern
+
+The `votes` list is used as a FIFO queue:
+
+| Operation | Command | Service | Description |
+|---|---|---|---|
+| Enqueue | `RPUSH votes <json>` | vote | Appends a new vote message to the right (tail) of the list |
+| Dequeue | `LPOP votes` | worker | Removes and returns the leftmost (oldest) message |
+
+This right-push / left-pop pattern ensures votes are processed in the order they were received.
+
+## Message format
+
+Each message is a JSON object serialized to a string:
+
+```json
+{"voter_id": "a3f1c9e2b7d04581", "vote": "a"}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `voter_id` | string | 64-bit random hex string, unique per browser session |
+| `vote` | string | The selected option — `a` or `b` |
+
+## Health check
+
+Redis uses a shell script mounted from the host to verify it is accepting connections:
+
+```yaml docker-compose.yml
+healthcheck:
+  test: /healthchecks/redis.sh
+  interval: "5s"
+```
+
+The script connects with `redis-cli` and checks that the response to `PING` is `PONG`:
+
+```bash healthchecks/redis.sh
+#!/bin/sh
+set -eo pipefail
+
+host="$(hostname -i || echo '127.0.0.1')"
+
+if ping="$(redis-cli -h "$host" ping)" && [ "$ping" = 'PONG' ]; then
+	exit 0
+fi
+
+exit 1
+```
+
+Both the vote service and the worker service declare `condition: service_healthy` on Redis, so Docker will not start them until this check passes.
+
+## Network
+
+Redis is attached to the **back-tier** network only. It is not exposed to the host machine or the front-tier network. Only the vote and worker containers can reach it.
+
+## Compose configuration
+
+```yaml docker-compose.yml
+redis:
+  image: redis:alpine
+  volumes:
+    - "./healthchecks:/healthchecks"
+  healthcheck:
+    test: /healthchecks/redis.sh
+    interval: "5s"
+  networks:
+    - back-tier
+```
+
+<Note>
+  Redis is not configured with a volume mount for data persistence. All queue contents are stored in memory and will be lost if the Redis container is restarted. Any votes that have been enqueued but not yet consumed by the worker will be dropped. In practice this window is very small — the worker drains the queue within 100 ms of each message arriving.
+</Note>
+
+## No external ports
+
+Redis does not expose any ports to the host. There is no `ports:` entry in the compose file for this service. It is only reachable from other containers on the `back-tier` network, using the hostname `redis`.

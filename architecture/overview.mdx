@@ -1,0 +1,71 @@
+---
+title: Architecture Overview
+description: A high-level walkthrough of the five-service distributed voting application and how data flows through it.
+---
+
+The Example Voting App is a deliberately simple distributed system built from five cooperating services. Each service is written in a different language and plays a distinct role in the data pipeline, making it a useful reference for understanding how containers communicate at a basic level.
+
+## The five services at a glance
+
+| Service | Technology | Exposed Port | Role |
+|---------|-----------|--------------|------|
+| `vote` | Python / Flask | `8080` → container `80` | Accepts votes from browser users via HTTP POST |
+| `redis` | Redis alpine | internal only | Acts as an in-memory queue between the vote service and the worker |
+| `worker` | .NET 7 / C# | none | Consumes votes from Redis and persists them to PostgreSQL |
+| `db` | PostgreSQL 15 alpine | internal only | Durable storage for cast votes |
+| `result` | Node.js / Express + Socket.IO | `8081` → container `80` | Queries PostgreSQL every second and streams live tallies to browsers |
+
+## Data flow
+
+<Steps>
+  <Step title="User casts a vote">
+    A browser request hits the **vote** Flask app on port `8080`. The app reads the `OPTION_A` and `OPTION_B` environment variables to determine the ballot choices (defaults: `Cats` and `Dogs`). On form submission it serialises `{voter_id, vote}` to JSON and calls `redis.rpush('votes', data)`, appending the payload to the right end of the `votes` list.
+  </Step>
+  <Step title="Vote lands in Redis">
+    **Redis** stores the list in memory, decoupling the vote service from the rest of the pipeline. This means the vote service never blocks waiting for a database write — it returns a response to the browser as soon as the push succeeds.
+  </Step>
+  <Step title="Worker drains the queue">
+    The **.NET worker** runs a tight loop, calling `ListLeftPop("votes")` every 100 ms. When a payload is available it deserialises the JSON and calls `UpdateVote`, which attempts an `INSERT` and falls back to an `UPDATE` if the `voter_id` already exists — giving each browser exactly one counted vote.
+  </Step>
+  <Step title="Vote persisted to PostgreSQL">
+    The **db** service (PostgreSQL 15) stores every vote in a `votes` table with columns `id VARCHAR UNIQUE` (the voter ID) and `vote VARCHAR`. The `UNIQUE` constraint on `id` is what enforces the one-vote-per-browser rule at the database level.
+  </Step>
+  <Step title="Result service queries PostgreSQL">
+    The **result** Node.js server opens a persistent PostgreSQL connection and runs `SELECT vote, COUNT(id) AS count FROM votes GROUP BY vote` on a one-second `setTimeout` loop. Results are immediately broadcast to all connected browsers via a Socket.IO `scores` event.
+  </Step>
+  <Step title="Browser receives live results">
+    The results page at port `8081` receives the `scores` event over a WebSocket and updates vote tallies in real time — no page reload required.
+  </Step>
+</Steps>
+
+## Why this design separates concerns
+
+**Async queue (Redis).** The vote service only needs to be fast and available for write traffic. By pushing to a Redis list rather than writing directly to PostgreSQL, it is isolated from any database slowness or downtime. The worker can fall behind and catch up without any votes being lost.
+
+**Separate read and write paths.** The worker owns all writes to PostgreSQL. The result service is read-only. This means the two access patterns — high-frequency small upserts versus aggregate query polling — never compete for the same connection or lock.
+
+**Language heterogeneity at the boundary.** Each service communicates over a well-defined protocol (HTTP, Redis list operations, PostgreSQL wire protocol, Socket.IO) rather than a language-specific interface. The services can be replaced or scaled independently.
+
+<Note>
+  The app intentionally does not validate votes server-side beyond the `UNIQUE` constraint. It is a learning reference, not a production-grade system.
+</Note>
+
+## Explore each service
+
+<CardGroup cols={2}>
+  <Card title="vote" icon="check" href="/services/vote">
+    Python / Flask app that renders the ballot and pushes votes to Redis.
+  </Card>
+  <Card title="worker" icon="gear" href="/services/worker">
+    .NET C# background process that drains Redis and upserts to PostgreSQL.
+  </Card>
+  <Card title="result" icon="chart-bar" href="/services/result">
+    Node.js app that streams live tallies to browsers via Socket.IO.
+  </Card>
+  <Card title="redis" icon="database" href="/services/redis">
+    In-memory queue that decouples the vote and worker services.
+  </Card>
+  <Card title="db" icon="circle-stack" href="/services/postgres">
+    PostgreSQL 15 database providing durable, persistent vote storage.
+  </Card>
+</CardGroup>

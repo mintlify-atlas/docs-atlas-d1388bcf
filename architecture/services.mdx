@@ -1,0 +1,252 @@
+---
+title: Services
+description: Detailed breakdown of each service's responsibilities, runtime, dependencies, and inter-service connections.
+---
+
+The voting app is composed of five services. Each runs in its own container and communicates with the others over named Docker networks using DNS-resolved service names.
+
+<Accordion title="vote — Python / Flask">
+
+**What it does**
+
+The `vote` service is the user-facing ballot application. It renders an HTML page with two options and accepts `POST` requests from the browser containing the user's choice.
+
+**Language / runtime**
+
+Python 3, served by Gunicorn. In the local development compose file the container is built from `./vote` with the `dev` target, and the source directory is bind-mounted so changes are reflected without a rebuild.
+
+**Key dependencies**
+
+- `flask` — HTTP routing and HTML template rendering
+- `redis` (Python client) — pushes vote payloads to the `votes` list
+- `gunicorn` — production-grade WSGI server
+
+**Configuration via environment variables**
+
+| Variable | Default | Purpose |
+|----------|---------|--------|
+| `OPTION_A` | `Cats` | Label for the first ballot option |
+| `OPTION_B` | `Dogs` | Label for the second ballot option |
+
+**How it connects to other services**
+
+On every `POST /`, the app:
+
+1. Reads or generates a `voter_id` cookie (a 64-bit random hex string).
+2. Serialises `{voter_id, vote}` to a JSON string.
+3. Calls `redis.rpush('votes', data)` — appending to the **right** end of the Redis list.
+
+It connects to Redis at the hostname `redis` on the default port `6379` with a 5-second socket timeout:
+
+```python
+g.redis = Redis(host="redis", db=0, socket_timeout=5)
+```
+
+The service has no direct connection to PostgreSQL.
+
+**Health check**
+
+Compose polls `curl -f http://localhost` every 15 seconds (5 s timeout, 3 retries, 10 s start period). The `worker` and `result` services wait on this health check via `depends_on`.
+
+</Accordion>
+
+<Accordion title="worker — .NET 7 / C#">
+
+**What it does**
+
+The `worker` is a headless background process. It bridges the Redis queue and the PostgreSQL database, continuously draining votes from Redis and persisting them durably.
+
+**Language / runtime**
+
+.NET 7, compiled to a self-contained binary and run inside the official .NET runtime image. There is no HTTP server — the worker is a pure console application.
+
+**Key dependencies**
+
+- `StackExchange.Redis` — connects to Redis and pops items from the `votes` list
+- `Npgsql` — PostgreSQL driver for .NET
+- `Newtonsoft.Json` — deserialises the JSON vote payload
+
+**How it connects to other services**
+
+At startup the worker opens connections to both Redis and PostgreSQL:
+
+```csharp
+var pgsql = OpenDbConnection("Server=db;Username=postgres;Password=postgres;");
+var redisConn = OpenRedisConnection("redis");
+```
+
+Both connection helpers retry indefinitely, logging `Waiting for db` / `Waiting for redis` until the services are healthy — making the worker robust to startup ordering.
+
+Inside the main loop (every 100 ms):
+
+```csharp
+string json = redis.ListLeftPopAsync("votes").Result;
+```
+
+This pops from the **left** end of the list — matching the right-push from the vote service to implement a FIFO queue.
+
+**Upsert logic**
+
+The worker calls `UpdateVote(pgsql, vote.voter_id, vote.vote)` which attempts an `INSERT`; if the voter ID already exists (violating the `UNIQUE` constraint) it falls back to an `UPDATE`:
+
+```csharp
+// First try
+command.CommandText = "INSERT INTO votes (id, vote) VALUES (@id, @vote)";
+// On DbException (duplicate key):
+command.CommandText = "UPDATE votes SET vote = @vote WHERE id = @id";
+```
+
+This means a user who changes their vote gets the new choice recorded, not a second row.
+
+**Schema creation**
+
+On first connection the worker creates the `votes` table if it does not exist:
+
+```sql
+CREATE TABLE IF NOT EXISTS votes (
+    id   VARCHAR(255) NOT NULL UNIQUE,
+    vote VARCHAR(255) NOT NULL
+);
+```
+
+**No exposed ports**
+
+The worker has no HTTP interface and no port mappings.
+
+</Accordion>
+
+<Accordion title="result — Node.js / Express + Socket.IO">
+
+**What it does**
+
+The `result` service serves the read-side of the application — a live dashboard that shows vote tallies updating in real time.
+
+**Language / runtime**
+
+Node.js with Express for static file serving and Socket.IO for WebSocket communication. In development, `nodemon --inspect=0.0.0.0 server.js` is used as the entrypoint, enabling hot-reload and the Node.js debugger.
+
+**Key dependencies**
+
+- `express` — HTTP server and static file middleware
+- `socket.io` — WebSocket server; broadcasts score updates to all connected browsers
+- `pg` (node-postgres) — PostgreSQL connection pool
+- `async` — retry helper for the initial database connection
+
+**How it connects to other services**
+
+The result service connects only to PostgreSQL:
+
+```javascript
+var pool = new Pool({
+  connectionString: 'postgres://postgres:postgres@db/postgres'
+});
+```
+
+The `async.retry` wrapper attempts the connection up to 1000 times (1-second intervals) before giving up, mirroring the resilience pattern used by the worker.
+
+**Real-time polling loop**
+
+Once connected, `getVotes` runs on a recursive `setTimeout` with a 1-second delay:
+
+```javascript
+function getVotes(client) {
+  client.query(
+    'SELECT vote, COUNT(id) AS count FROM votes GROUP BY vote',
+    [],
+    function(err, result) {
+      var votes = collectVotesFromResult(result);
+      io.sockets.emit("scores", JSON.stringify(votes));
+      setTimeout(function() { getVotes(client) }, 1000);
+    }
+  );
+}
+```
+
+Every browser with the result page open receives the `scores` event and re-renders the totals — no polling from the client side required.
+
+**No connection to Redis**
+
+The result service reads only from PostgreSQL. It has no knowledge of the Redis queue.
+
+</Accordion>
+
+<Accordion title="redis — Redis alpine">
+
+**What it does**
+
+Redis acts as an in-memory message queue between the `vote` service and the `worker`. It uses the Redis list data structure as a simple FIFO queue.
+
+**Image**
+
+`redis:alpine` — the official Redis image based on Alpine Linux for a minimal footprint.
+
+**Queue pattern**
+
+| Operation | Direction | Caller |
+|-----------|-----------|--------|
+| `RPUSH votes <json>` | appends to right | `vote` service |
+| `LPOP votes` | pops from left | `worker` service |
+
+This right-push / left-pop pattern ensures votes are processed in the order they were received.
+
+**Health check**
+
+Compose uses a custom script at `./healthchecks/redis.sh`, polled every 5 seconds. Both the `vote` and `worker` services wait for Redis to be healthy before starting.
+
+**No persistent volume in compose**
+
+In the development compose file Redis has no named volume — data is stored only in the container's ephemeral layer. In production deployments on Swarm or Kubernetes, Redis persistence should be configured explicitly if vote loss during a Redis restart is unacceptable.
+
+<Warning>
+  If the Redis container restarts, any votes that were pushed but not yet popped by the worker will be lost. For production use, configure Redis persistence (AOF or RDB) or use a managed queue service.
+</Warning>
+
+</Accordion>
+
+<Accordion title="db — PostgreSQL 15 alpine">
+
+**What it does**
+
+The `db` service provides durable, persistent storage for all cast votes. It is the single source of truth read by the result service.
+
+**Image**
+
+`postgres:15-alpine` — PostgreSQL 15 on Alpine Linux.
+
+**Schema**
+
+The `votes` table is created by the worker on first connection:
+
+```sql
+CREATE TABLE IF NOT EXISTS votes (
+    id   VARCHAR(255) NOT NULL UNIQUE,
+    vote VARCHAR(255) NOT NULL
+);
+```
+
+- `id` is the voter's browser cookie value. The `UNIQUE` constraint ensures one row per browser.
+- `vote` stores the option identifier (`a` or `b`).
+
+**Configuration**
+
+```yaml
+environment:
+  POSTGRES_USER: "postgres"
+  POSTGRES_PASSWORD: "postgres"
+```
+
+Both the worker and result service use these credentials hard-coded in their connection strings (suitable for a local demo; rotate credentials before any production deployment).
+
+**Persistence**
+
+Data is stored on the named Docker volume `db-data` mounted at `/var/lib/postgresql/data`, so votes survive container restarts.
+
+**Health check**
+
+A custom script at `./healthchecks/postgres.sh` is polled every 5 seconds. The `worker` and `result` services declare a `depends_on` condition on this health check.
+
+<Tip>
+  The result service queries `SELECT vote, COUNT(id) AS count FROM votes GROUP BY vote` — adding an index on the `vote` column would improve performance at scale, though it is unnecessary for this demo.
+</Tip>
+
+</Accordion>

@@ -1,0 +1,223 @@
+---
+title: Docker Compose
+description: Run the Example Voting App locally for development using Docker Compose with live code reloading.
+---
+
+Docker Compose is the fastest way to get the Example Voting App running on your local machine. The configuration builds all three application services from source and mounts local directories into the containers so code changes are reflected immediately — no rebuild required.
+
+## Prerequisites
+
+- [Docker Desktop](https://docs.docker.com/desktop/) (Mac, Windows, or Linux) **or** Docker Engine with the [Compose plugin](https://docs.docker.com/compose/install/) on Linux
+- Docker Compose v1.27 or later (the configuration uses Compose Spec, which merges the old v2 and v3 formats)
+- Git
+
+## Starting the app
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/dockersamples/example-voting-app.git
+    ```
+  </Step>
+
+  <Step title="Change into the project directory">
+    ```bash
+    cd example-voting-app
+    ```
+  </Step>
+
+  <Step title="Start all services">
+    ```bash
+    docker compose up
+    ```
+
+    Compose builds the `vote`, `result`, and `worker` images from source, then starts all five services (`vote`, `result`, `worker`, `redis`, `db`). The first run takes a few minutes while images are built and base layers are pulled.
+
+    Run with `-d` to start in detached (background) mode:
+
+    ```bash
+    docker compose up -d
+    ```
+  </Step>
+
+  <Step title="Open the app in your browser">
+    | Service | URL |
+    |---------|-----|
+    | Vote | [http://localhost:8080](http://localhost:8080) |
+    | Result | [http://localhost:8081](http://localhost:8081) |
+  </Step>
+</Steps>
+
+## Services and ports
+
+| Service | Image / Build | Port | Network |
+|---------|--------------|------|---------|
+| `vote` | Built from `./vote` (target: `dev`) | `8080:80` | front-tier, back-tier |
+| `result` | Built from `./result` | `8081:80`, `127.0.0.1:9229:9229` | front-tier, back-tier |
+| `worker` | Built from `./worker` | — | back-tier |
+| `redis` | `redis:alpine` | — | back-tier |
+| `db` | `postgres:15-alpine` | — | back-tier |
+
+The `result` service also exposes port `9229` on localhost for Node.js remote debugging via `nodemon --inspect`.
+
+## Live code reloading
+
+<Note>
+  Both `vote` and `result` mount their source directories directly into the running containers, so edits on your host are reflected inside the container without a rebuild.
+
+  - `./vote` → `/usr/local/app` (Python Flask app, built with `target: dev`)
+  - `./result` → `/usr/local/app` (Node.js app, started with `nodemon` for automatic restart)
+
+  The `worker` service does not have a volume mount; changes to worker code require `docker compose up --build`.
+</Note>
+
+## Health checks and startup ordering
+
+Compose enforces strict startup ordering using health checks to prevent connection errors during initialization:
+
+- `redis` runs a health check script at `./healthchecks/redis.sh` every 5 seconds.
+- `db` runs a health check script at `./healthchecks/postgres.sh` every 5 seconds.
+- `vote` waits for `redis` to report `healthy` before starting.
+- `result` waits for `db` to report `healthy` before starting.
+- `worker` waits for both `redis` and `db` to report `healthy` before starting.
+
+This means on first boot you will see `vote`, `result`, and `worker` in a `waiting` state until their dependencies pass their health checks.
+
+## Seeding the database with votes
+
+A `seed` service is included to pre-populate the database with sample votes. It is excluded from the default `docker compose up` run and must be activated with the `seed` profile:
+
+```bash
+docker compose --profile seed up -d
+```
+
+The `seed` service builds from `./seed-data`, depends on `vote` being healthy, submits votes via the front-tier network, and exits (`restart: "no"`). It will not restart if run again.
+
+## Stopping the app
+
+Stop and remove containers, networks, and anonymous volumes:
+
+```bash
+docker compose down
+```
+
+To also remove the named `db-data` volume (discards all database data):
+
+```bash
+docker compose down -v
+```
+
+## Rebuilding after code changes
+
+For services without a volume mount (e.g., `worker`), rebuild the image after making source changes:
+
+```bash
+docker compose up --build
+```
+
+To rebuild a specific service only:
+
+```bash
+docker compose up --build worker
+```
+
+## Full docker-compose.yml
+
+```yaml docker-compose.yml
+# version is now using "compose spec"
+# v2 and v3 are now combined!
+# docker-compose v1.27+ required
+
+services:
+  vote:
+    build: 
+      context: ./vote
+      target: dev
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck: 
+      test: ["CMD", "curl", "-f", "http://localhost"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    volumes:
+     - ./vote:/usr/local/app
+    ports:
+      - "8080:80"
+    networks:
+      - front-tier
+      - back-tier
+
+  result:
+    build: ./result
+    # use nodemon rather than node for local dev
+    entrypoint: nodemon --inspect=0.0.0.0 server.js
+    depends_on:
+      db:
+        condition: service_healthy 
+    volumes:
+      - ./result:/usr/local/app
+    ports:
+      - "8081:80"
+      - "127.0.0.1:9229:9229"
+    networks:
+      - front-tier
+      - back-tier
+
+  worker:
+    build:
+      context: ./worker
+    depends_on:
+      redis:
+        condition: service_healthy 
+      db:
+        condition: service_healthy 
+    networks:
+      - back-tier
+
+  redis:
+    image: redis:alpine
+    volumes:
+      - "./healthchecks:/healthchecks"
+    healthcheck:
+      test: /healthchecks/redis.sh
+      interval: "5s"
+    networks:
+      - back-tier
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: "postgres"
+      POSTGRES_PASSWORD: "postgres"
+    volumes:
+      - "db-data:/var/lib/postgresql/data"
+      - "./healthchecks:/healthchecks"
+    healthcheck:
+      test: /healthchecks/postgres.sh
+      interval: "5s"
+    networks:
+      - back-tier
+
+  # this service runs once to seed the database with votes
+  # it won't run unless you specify the "seed" profile
+  # docker compose --profile seed up -d
+  seed:
+    build: ./seed-data
+    profiles: ["seed"]
+    depends_on:
+      vote:
+        condition: service_healthy 
+    networks:
+      - front-tier
+    restart: "no"
+
+volumes:
+  db-data:
+
+networks:
+  front-tier:
+  back-tier:
+```

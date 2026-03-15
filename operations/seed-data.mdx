@@ -1,0 +1,100 @@
+---
+title: Seed data
+description: Populate the voting app with sample votes using the seed service.
+---
+
+The `seed` service submits a large batch of pre-generated votes to the vote service, giving you a realistic dataset to view on the results page without casting votes manually. It is defined in `docker-compose.yml` but only activates when you pass the `seed` profile.
+
+## What the seed service does
+
+The seed service is a small container built from `./seed-data`. On startup it:
+
+1. Uses `make-data.py` to generate URL-encoded POST body files (`posta` and `postb`) at build time.
+2. Runs `generate-votes.sh` using Apache Bench (`ab`) to send 3,000 HTTP POST requests to the vote service — 2,000 votes for option A and 1,000 for option B:
+
+```sh
+#!/bin/sh
+# create 3000 votes (2000 for option a, 1000 for option b)
+ab -n 1000 -c 50 -p posta -T "application/x-www-form-urlencoded" http://vote/
+ab -n 1000 -c 50 -p postb -T "application/x-www-form-urlencoded" http://vote/
+ab -n 1000 -c 50 -p posta -T "application/x-www-form-urlencoded" http://vote/
+```
+
+Each `ab` invocation sends concurrent POST requests at 50 concurrent connections. The seed container exits after all three batches complete.
+
+## Compose configuration
+
+```yaml
+seed:
+  build: ./seed-data
+  profiles: ["seed"]
+  depends_on:
+    vote:
+      condition: service_healthy
+  networks:
+    - front-tier
+  restart: "no"
+```
+
+Key details:
+
+- **`profiles: ["seed"]`** — the service is ignored unless you activate the `seed` profile. A plain `docker compose up` will never start it.
+- **`depends_on: vote: condition: service_healthy`** — seed waits for the vote service health check to pass before sending any requests, preventing connection errors during Flask startup.
+- **`restart: "no"`** — the container runs once and is not restarted. This prevents it from looping and inflating vote counts.
+- **`networks: front-tier`** — the seed container connects to the same network as the vote service so it can reach `http://vote/` by service name.
+
+## How to seed the database
+
+<Steps>
+  <Step title="Start the app">
+    Bring up the full stack without the seed service:
+
+    ```bash
+    docker compose up -d
+    ```
+
+    Wait for all services to report as healthy:
+
+    ```bash
+    docker compose ps
+    ```
+  </Step>
+
+  <Step title="Run the seed service">
+    Start the stack again with the `seed` profile enabled. Compose will start only the seed service (the others are already running):
+
+    ```bash
+    docker compose --profile seed up -d
+    ```
+
+    The seed container submits 3,000 votes and then exits. You can follow its progress:
+
+    ```bash
+    docker compose logs -f seed
+    ```
+  </Step>
+
+  <Step title="View the results">
+    Open the results dashboard in your browser:
+
+    ```
+    http://localhost:8081
+    ```
+
+    The page updates in real time via Socket.IO. You should see approximately 2,000 votes for option A and 1,000 for option B reflected immediately.
+  </Step>
+</Steps>
+
+<Tip>
+The seed data is useful for demoing the results page to stakeholders or testing the real-time update behavior of the Socket.IO dashboard without having to cast votes by hand. With 3,000 votes already in the database the chart shows a clear split from the moment the page loads.
+</Tip>
+
+## Re-seeding
+
+Because the worker deduplicates votes by `voter_id`, running the seed service a second time will update existing votes rather than add new ones (each `ab` request creates a unique voter). To start from a clean slate, remove the database volume and recreate the stack:
+
+```bash
+docker compose down -v
+docker compose up -d
+docker compose --profile seed up -d
+```

@@ -1,0 +1,130 @@
+---
+title: Configuration
+description: Environment variables, port mappings, and volume mounts for the Example Voting App.
+---
+
+The Example Voting App is configured through environment variables defined in `docker-compose.yml`. This page covers all available variables, externally exposed ports, and volume mounts.
+
+## Environment variables
+
+| Variable | Service | Default | Description |
+|---|---|---|---|
+| `OPTION_A` | `vote` | `Cats` | Label for vote option A, shown on the voting page |
+| `OPTION_B` | `vote` | `Dogs` | Label for vote option B, shown on the voting page |
+| `POSTGRES_USER` | `db` | `postgres` | PostgreSQL username used by the db container and the worker/result services |
+| `POSTGRES_PASSWORD` | `db` | `postgres` | PostgreSQL password |
+| `PORT` | `result` | `4000` | Internal port the result Node.js server listens on |
+
+### Vote option labels
+
+`OPTION_A` and `OPTION_B` are read at startup in `vote/app.py`:
+
+```python
+option_a = os.getenv('OPTION_A', "Cats")
+option_b = os.getenv('OPTION_B', "Dogs")
+```
+
+They are passed directly into the HTML template and displayed as the two voting choices.
+
+### Result service port
+
+The result service reads `PORT` from the environment in `result/server.js`:
+
+```javascript
+var port = process.env.PORT || 4000;
+```
+
+The container port is mapped to host port `8081` in the Compose file regardless of the internal `PORT` value.
+
+## Overriding variables in docker-compose.yml
+
+Use the `environment:` block under the relevant service to override any variable:
+
+```yaml
+services:
+  vote:
+    build:
+      context: ./vote
+      target: dev
+    environment:
+      OPTION_A: "Tabs"
+      OPTION_B: "Spaces"
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: "myuser"
+      POSTGRES_PASSWORD: "a-strong-password"
+```
+
+After editing the file, recreate the affected services:
+
+```bash
+docker compose up -d --force-recreate vote db
+```
+
+<Warning>
+The default `POSTGRES_USER` and `POSTGRES_PASSWORD` values (`postgres` / `postgres`) are hardcoded in the worker (`Program.cs`) and result (`server.js`) connection strings. If you change these credentials, you must update those connection strings as well before redeploying.
+</Warning>
+
+## Port mappings
+
+The following ports are exposed to the host:
+
+| Service | Host port | Container port | Description |
+|---|---|---|---|
+| `vote` | `8080` | `80` | Voting interface (Flask/Gunicorn) |
+| `result` | `8081` | `80` | Results dashboard (Node.js + Socket.IO) |
+| `result` | `127.0.0.1:9229` | `9229` | Node.js inspector (local dev only, bound to loopback) |
+
+Access the app after starting:
+
+- Vote: [http://localhost:8080](http://localhost:8080)
+- Results: [http://localhost:8081](http://localhost:8081)
+
+If either port is already in use on your machine, change the host-side mapping in `docker-compose.yml`:
+
+```yaml
+ports:
+  - "9080:80"   # use 9080 instead of 8080
+```
+
+## Volume mounts
+
+### Database persistence
+
+PostgreSQL data is stored in a named volume so votes survive container restarts:
+
+```yaml
+volumes:
+  db-data:
+
+services:
+  db:
+    volumes:
+      - "db-data:/var/lib/postgresql/data"
+```
+
+To reset all vote data, remove the volume:
+
+```bash
+docker compose down -v
+```
+
+### Development hot-reload
+
+In the `dev` Compose setup, source directories are bind-mounted into the running containers. This means changes to local files are reflected immediately without rebuilding the image.
+
+```yaml
+services:
+  vote:
+    volumes:
+      - ./vote:/usr/local/app   # Python source; watchdog restarts Flask on changes
+
+  result:
+    entrypoint: nodemon --inspect=0.0.0.0 server.js
+    volumes:
+      - ./result:/usr/local/app  # Node.js source; nodemon restarts on changes
+```
+
+The `vote` dev target installs `watchdog` and runs `python app.py` directly, which auto-reloads on file changes. The `result` service uses `nodemon` to achieve the same for JavaScript.

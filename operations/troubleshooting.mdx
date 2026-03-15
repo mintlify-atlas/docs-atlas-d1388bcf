@@ -1,0 +1,237 @@
+---
+title: Troubleshooting
+description: Diagnose and fix common issues with the Example Voting App across Docker Compose, Swarm, and Kubernetes.
+---
+
+Use the sections below to diagnose and resolve the most common problems encountered when running the Example Voting App.
+
+## General commands
+
+Before diving into specific issues, these commands cover the most common first steps:
+
+```bash
+# View status and health of all services
+docker compose ps
+
+# Tail logs for a specific service
+docker compose logs -f vote
+
+# View logs for all services
+docker compose logs
+
+# Restart a single service without recreating others
+docker compose restart <service>
+
+# Rebuild and recreate a single service
+docker compose up -d --force-recreate <service>
+```
+
+## Issues
+
+<AccordionGroup>
+  <Accordion title="Services not starting or stuck in 'waiting' state">
+    **Symptom:** One or more services show `starting` or never become `running` in `docker compose ps`.
+
+    **Cause:** A dependency service is unhealthy. Docker Compose holds services with `condition: service_healthy` in the waiting state until the health check passes.
+
+    **Steps to diagnose:**
+
+    ```bash
+    docker compose ps
+    ```
+
+    Look for services with `(unhealthy)` or `(starting)` in the STATUS column. Inspect the failing service:
+
+    ```bash
+    docker compose logs redis
+    docker compose logs db
+    ```
+
+    Check the raw health check output:
+
+    ```bash
+    docker inspect --format='{{json .State.Health}}' example-voting-app-redis-1
+    ```
+
+    **Resolution:** Fix the unhealthy dependency first. Once `redis` and `db` report `(healthy)`, the dependent services (`vote`, `result`, `worker`) will start automatically.
+  </Accordion>
+
+  <Accordion title="Vote service can't connect to Redis">
+    **Symptom:** The vote container logs show connection errors to Redis, or the voting page returns a 500 error.
+
+    **Cause:** The `redis` container is not healthy, has not started yet, or the container is not on the `back-tier` network.
+
+    **Steps to diagnose:**
+
+    ```bash
+    # Check redis health
+    docker compose ps redis
+
+    # Check redis logs
+    docker compose logs redis
+
+    # Verify network membership
+    docker network inspect example-voting-app_back-tier
+    ```
+
+    The `vote` service connects to the hostname `redis` on the `back-tier` network. If the redis container is not present on that network the DNS lookup will fail.
+
+    **Resolution:**
+
+    ```bash
+    docker compose restart redis
+    docker compose restart vote
+    ```
+  </Accordion>
+
+  <Accordion title="Worker not processing votes">
+    **Symptom:** Votes are cast on the vote page but the results dashboard does not update. The `votes` table in PostgreSQL stays empty.
+
+    **Cause:** The worker requires both `redis` and `db` to be healthy. If either is down, the worker will not start or will exit. The worker also reconnects automatically if Redis drops, but it logs these events.
+
+    **Steps to diagnose:**
+
+    ```bash
+    # Check worker status
+    docker compose ps worker
+
+    # Check worker logs for connection errors
+    docker compose logs worker
+    ```
+
+    Look for lines like `Waiting for db`, `Waiting for redis`, or `Reconnecting Redis`. These indicate the worker is retrying but the dependency is not available.
+
+    **Resolution:** Ensure both `redis` and `db` are healthy, then restart the worker:
+
+    ```bash
+    docker compose restart worker
+    ```
+  </Accordion>
+
+  <Accordion title="Result page shows 0 votes">
+    **Symptom:** The results page loads but shows zero votes for both options, even after casting votes.
+
+    **Possible causes:**
+    - The worker is not running or is not processing the Redis queue.
+    - The `db` container is unhealthy and the result service cannot query PostgreSQL.
+    - The result service cannot connect to `db`.
+
+    **Steps to diagnose:**
+
+    ```bash
+    # Verify worker is running
+    docker compose ps worker
+
+    # Verify db is healthy
+    docker compose ps db
+
+    # Check result service logs for DB connection errors
+    docker compose logs result
+    ```
+
+    The result service (`server.js`) retries the PostgreSQL connection up to 1,000 times with a 1-second interval. If `db` took a long time to become healthy you may see `Waiting for db` in the logs before it connects.
+
+    **Resolution:**
+
+    ```bash
+    docker compose restart worker
+    docker compose restart result
+    ```
+  </Accordion>
+
+  <Accordion title="Port already in use (8080 or 8081)">
+    **Symptom:** `docker compose up` fails with an error like `Bind for 0.0.0.0:8080 failed: port is already allocated`.
+
+    **Cause:** Another process or container is already bound to port 8080 or 8081 on the host.
+
+    **Resolution — option 1:** Stop the conflicting container or process.
+
+    ```bash
+    # Find what is using the port
+    sudo lsof -i :8080
+    ```
+
+    **Resolution — option 2:** Change the host-side port mapping in `docker-compose.yml`:
+
+    ```yaml
+    services:
+      vote:
+        ports:
+          - "9080:80"   # changed from 8080
+
+      result:
+        ports:
+          - "9081:80"   # changed from 8081
+          - "127.0.0.1:9229:9229"
+    ```
+
+    Then run `docker compose up -d` again.
+  </Accordion>
+
+  <Accordion title="Debugging the result service (Node.js inspector)">
+    **Symptom:** You need to attach a debugger to the Node.js result service.
+
+    The result service starts with `nodemon --inspect=0.0.0.0 server.js` in the dev Compose file, and port `9229` is exposed on `127.0.0.1` only:
+
+    ```yaml
+    result:
+      ports:
+        - "127.0.0.1:9229:9229"
+    ```
+
+    Connect Chrome DevTools or VS Code's Node.js debugger to `127.0.0.1:9229`. In Chrome, navigate to `chrome://inspect` and click **Open dedicated DevTools for Node**.
+
+    The port is bound to the loopback interface only (`127.0.0.1`) so it is not accessible from other machines on the network.
+  </Accordion>
+
+  <Accordion title="Docker Swarm: image not found or service won't start">
+    **Symptom:** After running `docker stack deploy`, one or more services show `No such image` or remain in `Preparing` state.
+
+    **Cause:** The Swarm stack file (`docker-stack.yml`) references pre-built images on Docker Hub (`dockersamples/examplevotingapp_vote`, etc.). Unlike Compose, Swarm cannot build images at deploy time — the images must already exist in a registry accessible to all nodes.
+
+    **Resolution:** Build and push the images before deploying:
+
+    ```bash
+    docker build -t dockersamples/examplevotingapp_vote ./vote
+    docker build -t dockersamples/examplevotingapp_result ./result
+    docker build -t dockersamples/examplevotingapp_worker ./worker
+    docker push dockersamples/examplevotingapp_vote
+    docker push dockersamples/examplevotingapp_result
+    docker push dockersamples/examplevotingapp_worker
+    ```
+
+    To see the full error from Swarm scheduling:
+
+    ```bash
+    docker stack ps vote --no-trunc
+    ```
+
+    The `--no-trunc` flag shows the complete error message, which is otherwise cut off in the default output.
+  </Accordion>
+
+  <Accordion title="Kubernetes: pods not starting or crashing">
+    **Symptom:** After applying the Kubernetes manifests, pods are in `Pending`, `CrashLoopBackOff`, or `Error` state.
+
+    **Steps to diagnose:**
+
+    ```bash
+    # Check pod status across all namespaces (or specify -n <namespace>)
+    kubectl get pods
+
+    # Describe a pod for events and error details
+    kubectl describe pod <pod-name>
+
+    # View container logs
+    kubectl logs <pod-name>
+
+    # Follow logs live
+    kubectl logs -f <pod-name>
+    ```
+
+    Common causes on Kubernetes:
+
+    - **Image pull errors** (`ErrImagePull`, `ImagePullBackOff`): the image name or tag is incorrect, or the cluster cannot reach the registry. Check `kubectl describe pod <pod-name>` for the exact error.
+    - **CrashLoopBackOff on worker or result**: the database pod is not ready yet. Kubernetes restarts the container on a back-off timer; once `db` is running the worker or result pod will stabilize.
+    - **Pending pods**: insufficient cluster resources. Run `kubectl describe pod <pod-name>` and look for `Insufficient cpu` or `Insufficient memory` under Events.
+  </Accordion>
+</AccordionGroup>

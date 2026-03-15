@@ -1,0 +1,162 @@
+---
+title: Health checks
+description: How Docker Compose health checks enforce startup ordering between the voting app services.
+---
+
+The Example Voting App uses Docker Compose health checks to guarantee that dependent services only start after their dependencies are ready to accept connections. Without this, the worker could attempt to connect to Redis or PostgreSQL before those services are initialized, causing startup failures.
+
+## Dependency ordering with `condition: service_healthy`
+
+Docker Compose supports a `depends_on` condition of `service_healthy`, which holds a service in the "waiting" state until the target service's health check passes. The app uses this to enforce the following startup order:
+
+- `vote` waits for `redis` to be healthy before starting
+- `result` waits for `db` to be healthy before starting
+- `worker` waits for both `redis` and `db` to be healthy before starting
+- `seed` (when active) waits for `vote` to be healthy before sending requests
+
+## Redis health check
+
+The `redis` service mounts the `./healthchecks` directory and runs `redis.sh` at a 5-second interval:
+
+```yaml
+redis:
+  image: redis:alpine
+  volumes:
+    - "./healthchecks:/healthchecks"
+  healthcheck:
+    test: /healthchecks/redis.sh
+    interval: "5s"
+```
+
+The script uses `redis-cli ping` and expects a `PONG` response:
+
+```sh
+#!/bin/sh
+set -eo pipefail
+
+host="$(hostname -i || echo '127.0.0.1')"
+
+if ping="$(redis-cli -h "$host" ping)" && [ "$ping" = 'PONG' ]; then
+  exit 0
+fi
+
+exit 1
+```
+
+## PostgreSQL health check
+
+The `db` service similarly mounts the healthchecks directory and runs `postgres.sh` every 5 seconds:
+
+```yaml
+db:
+  image: postgres:15-alpine
+  environment:
+    POSTGRES_USER: "postgres"
+    POSTGRES_PASSWORD: "postgres"
+  volumes:
+    - "db-data:/var/lib/postgresql/data"
+    - "./healthchecks:/healthchecks"
+  healthcheck:
+    test: /healthchecks/postgres.sh
+    interval: "5s"
+```
+
+The script connects via `psql` over TCP (not a Unix socket) and runs `SELECT 1` to verify the database is accepting queries:
+
+```bash
+#!/bin/bash
+set -eo pipefail
+
+host="$(hostname -i || echo '127.0.0.1')"
+user="${POSTGRES_USER:-postgres}"
+db="${POSTGRES_DB:-$POSTGRES_USER}"
+export PGPASSWORD="${POSTGRES_PASSWORD:-}"
+
+args=(
+  --host "$host"
+  --username "$user"
+  --dbname "$db"
+  --quiet --no-align --tuples-only
+)
+
+if select="$(echo 'SELECT 1' | psql "${args[@]}")" && [ "$select" = '1' ]; then
+  exit 0
+fi
+
+exit 1
+```
+
+Using TCP rather than a Unix socket validates that PostgreSQL is reachable the same way external clients (worker, result) will connect to it.
+
+## Vote service health check
+
+The `vote` service has its own health check so the `seed` profile service knows when the voting endpoint is ready:
+
+```yaml
+vote:
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://localhost"]
+    interval: 15s
+    timeout: 5s
+    retries: 3
+    start_period: 10s
+```
+
+`curl -f` exits non-zero on HTTP error responses, so the check only passes when Flask is serving requests successfully. The `start_period: 10s` gives the Python app time to import and bind before the retry counter starts.
+
+## Full depends_on configuration
+
+```yaml
+services:
+  vote:
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  result:
+    depends_on:
+      db:
+        condition: service_healthy
+
+  worker:
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+
+  seed:
+    profiles: ["seed"]
+    depends_on:
+      vote:
+        condition: service_healthy
+```
+
+## Checking health status
+
+Run `docker compose ps` to see the current health status of all services:
+
+```bash
+docker compose ps
+```
+
+Example output:
+
+```
+NAME                        STATUS
+example-voting-app-db-1     running (healthy)
+example-voting-app-redis-1  running (healthy)
+example-voting-app-vote-1   running (healthy)
+example-voting-app-result-1 running (healthy)
+example-voting-app-worker-1 running
+```
+
+For more detail on a specific service:
+
+```bash
+docker inspect --format='{{json .State.Health}}' example-voting-app-redis-1
+```
+
+<Note>
+The health check scripts (`redis.sh` and `postgres.sh`) are stored in the `./healthchecks` directory at the project root and are mounted read-only into both the `redis` and `db` containers at runtime. The scripts are not baked into the images.
+</Note>

@@ -1,0 +1,216 @@
+---
+title: Kubernetes
+description: Deploy the Example Voting App to a Kubernetes cluster using the provided manifests in k8s-specifications/.
+---
+
+The `k8s-specifications/` directory contains Kubernetes `Deployment` and `Service` manifests for every component of the voting app. Each service runs as a separate Deployment and is exposed via a Kubernetes Service.
+
+## Prerequisites
+
+- A running Kubernetes cluster — options include:
+  - [minikube](https://minikube.sigs.k8s.io/docs/start/) for local development
+  - [kind](https://kind.sigs.k8s.io/) (Kubernetes in Docker)
+  - A managed cloud cluster (GKE, EKS, AKS, etc.)
+- `kubectl` configured to point at your cluster (`kubectl cluster-info` to verify)
+
+## Deploying the app
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/dockersamples/example-voting-app.git
+    cd example-voting-app
+    ```
+  </Step>
+
+  <Step title="Apply all manifests">
+    ```bash
+    kubectl create -f k8s-specifications/
+    ```
+
+    Kubernetes creates all Deployments and Services defined in the directory. Resources are created in the `default` namespace.
+  </Step>
+
+  <Step title="Wait for pods to become ready">
+    ```bash
+    kubectl get pods --watch
+    ```
+
+    Wait until all pods show `Running` in the `STATUS` column and the `READY` column shows `1/1`.
+  </Step>
+
+  <Step title="Access the app">
+    See the [Accessing the app](#accessing-the-app) section below for instructions specific to your cluster type.
+  </Step>
+</Steps>
+
+## Manifests in k8s-specifications/
+
+| File | Kind | What it creates |
+|------|------|------------------|
+| `vote-deployment.yaml` | Deployment | 1 replica of `dockersamples/examplevotingapp_vote`, port 80 |
+| `vote-service.yaml` | Service (NodePort) | Exposes vote on NodePort **31000**, cluster port 8080 |
+| `result-deployment.yaml` | Deployment | 1 replica of `dockersamples/examplevotingapp_result`, port 80 |
+| `result-service.yaml` | Service (NodePort) | Exposes result on NodePort **31001**, cluster port 8081 |
+| `worker-deployment.yaml` | Deployment | 1 replica of `dockersamples/examplevotingapp_worker` (no port) |
+| `redis-deployment.yaml` | Deployment | 1 replica of `redis:alpine`, port 6379, `emptyDir` volume |
+| `redis-service.yaml` | Service (ClusterIP) | Internal DNS name `redis`, port 6379 |
+| `db-deployment.yaml` | Deployment | 1 replica of `postgres:15-alpine`, port 5432, `emptyDir` volume |
+| `db-service.yaml` | Service (ClusterIP) | Internal DNS name `db`, port 5432 |
+
+<Note>
+  The `redis` and `db` Deployments use `emptyDir` volumes. Data is not persisted across pod restarts. For production use, replace these with `PersistentVolumeClaim` resources.
+</Note>
+
+## Accessing the app
+
+<Tabs>
+  <Tab title="minikube">
+    Get the minikube node IP:
+
+    ```bash
+    minikube ip
+    ```
+
+    Then open the following URLs, substituting `<MINIKUBE_IP>` with the output of the command above:
+
+    | Service | URL |
+    |---------|-----|
+    | Vote | `http://<MINIKUBE_IP>:31000` |
+    | Result | `http://<MINIKUBE_IP>:31001` |
+
+    Alternatively, use `minikube service` to open each service directly in your browser:
+
+    ```bash
+    minikube service vote
+    minikube service result
+    ```
+  </Tab>
+  <Tab title="kind">
+    `kind` does not expose NodePort services on the host by default. Map the ports when creating the cluster:
+
+    ```yaml kind-config.yaml
+    kind: Cluster
+    apiVersion: kind.x-k8s.io/v1alpha4
+    nodes:
+    - role: control-plane
+      extraPortMappings:
+      - containerPort: 31000
+        hostPort: 31000
+      - containerPort: 31001
+        hostPort: 31001
+    ```
+
+    ```bash
+    kind create cluster --config kind-config.yaml
+    ```
+
+    After deploying the manifests, access the app at:
+
+    | Service | URL |
+    |---------|-----|
+    | Vote | [http://localhost:31000](http://localhost:31000) |
+    | Result | [http://localhost:31001](http://localhost:31001) |
+  </Tab>
+  <Tab title="Cloud cluster (GKE, EKS, AKS)">
+    Retrieve the external IP of any node:
+
+    ```bash
+    kubectl get nodes -o wide
+    ```
+
+    Use the `EXTERNAL-IP` of any node with the NodePort:
+
+    | Service | URL |
+    |---------|-----|
+    | Vote | `http://<NODE_EXTERNAL_IP>:31000` |
+    | Result | `http://<NODE_EXTERNAL_IP>:31001` |
+
+    <Info>
+      Cloud providers typically block NodePort traffic by default. Ensure your firewall rules or security groups allow inbound TCP traffic on ports 31000 and 31001.
+    </Info>
+  </Tab>
+</Tabs>
+
+## Inspecting resources
+
+<CodeGroup>
+
+```bash Deployments
+kubectl get deployments
+```
+
+```bash Services
+kubectl get services
+```
+
+```bash Pods
+kubectl get pods
+```
+
+```bash Describe a pod
+kubectl describe pod <pod-name>
+```
+
+```bash View pod logs
+kubectl logs <pod-name>
+```
+
+</CodeGroup>
+
+## Removing the app
+
+```bash
+kubectl delete -f k8s-specifications/
+```
+
+This removes all Deployments and Services created from the manifests. Because `redis` and `db` use `emptyDir` volumes (not PersistentVolumeClaims), no additional cleanup is required.
+
+## YAML reference
+
+The `vote` Service uses `NodePort` to make the vote frontend reachable from outside the cluster:
+
+```yaml vote-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: vote
+  name: vote
+spec:
+  type: NodePort
+  ports:
+  - name: "vote-service"
+    port: 8080
+    targetPort: 80
+    nodePort: 31000
+  selector:
+    app: vote
+```
+
+The `vote` Deployment pulls the pre-built image and exposes container port 80:
+
+```yaml vote-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: vote
+  name: vote
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vote
+  template:
+    metadata:
+      labels:
+        app: vote
+    spec:
+      containers:
+      - image: dockersamples/examplevotingapp_vote
+        name: vote
+        ports:
+        - containerPort: 80
+          name: vote
+```

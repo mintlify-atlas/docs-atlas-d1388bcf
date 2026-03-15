@@ -1,0 +1,169 @@
+---
+title: Docker Swarm
+description: Deploy the Example Voting App as a production-style stack on Docker Swarm with multiple replicas.
+---
+
+Docker Swarm lets you deploy the voting app as a named stack with multiple replicas and built-in load balancing. Unlike the Docker Compose setup, Swarm uses pre-built images from Docker Hub rather than building from source.
+
+<Warning>
+  `docker-stack.yml` is intended exclusively for Docker Swarm. Do not use it with `docker compose up` — it will fail because multiple replicas of `vote` and `worker` cannot bind to the same host port when running outside of Swarm mode.
+</Warning>
+
+## Prerequisites
+
+- Docker Engine with Swarm mode enabled (single node or multi-node cluster)
+- Access to pull images from Docker Hub
+
+## Deploying the stack
+
+<Steps>
+  <Step title="Initialize a Swarm (skip if already in Swarm mode)">
+    ```bash
+    docker swarm init
+    ```
+
+    On a machine with multiple network interfaces, specify the advertise address:
+
+    ```bash
+    docker swarm init --advertise-addr <YOUR_IP>
+    ```
+  </Step>
+
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/dockersamples/example-voting-app.git
+    cd example-voting-app
+    ```
+  </Step>
+
+  <Step title="Deploy the stack">
+    ```bash
+    docker stack deploy --compose-file docker-stack.yml vote
+    ```
+
+    Docker pulls all required images from Docker Hub and schedules the services across the Swarm. The stack is named `vote`.
+  </Step>
+
+  <Step title="Verify the stack is running">
+    ```bash
+    docker stack services vote
+    ```
+
+    Wait until the `REPLICAS` column shows all desired replicas as ready (e.g., `2/2` for `vote` and `worker`).
+  </Step>
+
+  <Step title="Open the app in your browser">
+    | Service | URL |
+    |---------|-----|
+    | Vote | [http://localhost:8080](http://localhost:8080) |
+    | Result | [http://localhost:8081](http://localhost:8081) |
+  </Step>
+</Steps>
+
+## Services and replica counts
+
+| Service | Image | Replicas | Published Port |
+|---------|-------|----------|----------------|
+| `vote` | `dockersamples/examplevotingapp_vote` | 2 | `8080:80` |
+| `result` | `dockersamples/examplevotingapp_result` | 1 | `8081:80` |
+| `worker` | `dockersamples/examplevotingapp_worker` | 2 | — |
+| `redis` | `redis:alpine` | 1 | — |
+| `db` | `postgres:15-alpine` | 1 | — |
+
+Swarm's internal routing mesh distributes incoming requests across all replicas of `vote` and `worker` automatically — no external load balancer is needed for a single-node deployment.
+
+## Managing the stack
+
+<CodeGroup>
+
+```bash List all stacks
+docker stack ls
+```
+
+```bash List services in the vote stack
+docker stack services vote
+```
+
+```bash List all tasks (containers) in the vote stack
+docker stack ps vote
+```
+
+```bash Scale a service
+docker service scale vote_vote=3
+```
+
+```bash View logs for a service
+docker service logs vote_vote
+```
+
+</CodeGroup>
+
+## Removing the stack
+
+```bash
+docker stack rm vote
+```
+
+This stops and removes all containers, networks, and services associated with the stack. The `db-data` volume is retained and must be removed separately if desired:
+
+```bash
+docker volume rm vote_db-data
+```
+
+## Full docker-stack.yml
+
+```yaml docker-stack.yml
+# this file is meant for Docker Swarm stacks only
+# trying it in compose will fail because of multiple replicas trying to bind to the same port
+# Swarm currently does not support Compose Spec, so we'll pin to the older version 3.9
+
+version: "3.9"
+
+services:
+
+  redis:
+    image: redis:alpine
+    networks:
+      - frontend
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: "postgres"
+      POSTGRES_PASSWORD: "postgres"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    networks:
+      - backend
+
+  vote:
+    image: dockersamples/examplevotingapp_vote
+    ports:
+      - 8080:80
+    networks:
+      - frontend
+    deploy:
+      replicas: 2
+
+  result:
+    image: dockersamples/examplevotingapp_result
+    ports:
+      - 8081:80
+    networks:
+      - backend
+
+  worker:
+    image: dockersamples/examplevotingapp_worker
+    networks:
+      - frontend
+      - backend
+    deploy:
+      replicas: 2
+
+networks:
+  frontend:
+  backend:
+
+volumes:
+  db-data:
+```

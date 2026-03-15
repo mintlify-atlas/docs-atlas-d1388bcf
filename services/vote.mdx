@@ -1,0 +1,177 @@
+---
+title: Vote
+description: Front-end voting interface built with Python and Flask.
+---
+
+The vote service is the public-facing web application where users cast their votes. It accepts HTTP requests, records votes to a Redis queue, and renders the voting UI with configurable option labels.
+
+## Technology
+
+| Component | Version |
+|---|---|
+| Python | 3.11-slim |
+| Flask | latest |
+| Redis client | latest |
+| gunicorn | latest (4 workers) |
+
+## Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `OPTION_A` | `Cats` | Label for the first voting option |
+| `OPTION_B` | `Dogs` | Label for the second voting option |
+
+## HTTP routes
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/` | Renders the voting page. Reads the `voter_id` cookie to show the current selection. |
+| `POST` | `/` | Accepts a vote form submission, pushes the vote to Redis, and re-renders the page. |
+
+Both methods are handled by a single route function:
+
+```python app.py
+@app.route("/", methods=['POST','GET'])
+def hello():
+    voter_id = request.cookies.get('voter_id')
+    if not voter_id:
+        voter_id = hex(random.getrandbits(64))[2:-1]
+
+    vote = None
+
+    if request.method == 'POST':
+        redis = get_redis()
+        vote = request.form['vote']
+        app.logger.info('Received vote for %s', vote)
+        data = json.dumps({'voter_id': voter_id, 'vote': vote})
+        redis.rpush('votes', data)
+
+    resp = make_response(render_template(
+        'index.html',
+        option_a=option_a,
+        option_b=option_b,
+        hostname=hostname,
+        vote=vote,
+    ))
+    resp.set_cookie('voter_id', voter_id)
+    return resp
+```
+
+## Voter identity
+
+Each browser session gets a unique `voter_id` cookie that persists across page loads. If no cookie is present, a new ID is generated as a 64-bit random hex string:
+
+```python app.py
+voter_id = hex(random.getrandbits(64))[2:-1]
+```
+
+This ID is included in every vote message pushed to Redis. The worker service uses this ID as the primary key in PostgreSQL, so submitting a new vote from the same browser **overwrites** the previous vote rather than counting it twice.
+
+## Redis integration
+
+The service connects to the `redis` host on startup using a per-request lazy connection stored on Flask's application context (`g`):
+
+```python app.py
+def get_redis():
+    if not hasattr(g, 'redis'):
+        g.redis = Redis(host="redis", db=0, socket_timeout=5)
+    return g.redis
+```
+
+On each `POST`, the vote is serialized as JSON and appended to the `votes` list with `RPUSH`:
+
+```python app.py
+data = json.dumps({'voter_id': voter_id, 'vote': vote})
+redis.rpush('votes', data)
+```
+
+The worker service consumes from the other end of this list with `LPOP`, giving FIFO ordering.
+
+## Dependencies
+
+```text requirements.txt
+Flask
+Redis
+gunicorn
+```
+
+## Port mapping
+
+| Scope | Port |
+|---|---|
+| Container (internal) | `80` |
+| Host (external) | `8080` |
+
+Access the voting UI at [http://localhost:8080](http://localhost:8080) when running locally.
+
+## Networks
+
+The vote service is attached to both Docker networks:
+
+- **front-tier** — accessible from the host machine
+- **back-tier** — allows communication with the Redis service
+
+## Dockerfile
+
+The Dockerfile uses a three-stage build:
+
+<Steps>
+  <Step title="base">
+    Starts from `python:3.11-slim`, installs `curl` for the health check, and installs Python dependencies from `requirements.txt`.
+
+    ```dockerfile Dockerfile
+    FROM python:3.11-slim AS base
+
+    RUN apt-get update && \
+        apt-get install -y --no-install-recommends curl && \
+        rm -rf /var/lib/apt/lists/*
+
+    WORKDIR /usr/local/app
+
+    COPY requirements.txt ./requirements.txt
+    RUN pip install --no-cache-dir -r requirements.txt
+    ```
+  </Step>
+  <Step title="dev">
+    Extends `base` with `watchdog` for filesystem watching and runs the Flask development server directly. This is the target used by `docker compose` for local development.
+
+    ```dockerfile Dockerfile
+    FROM base AS dev
+    RUN pip install watchdog
+    ENV FLASK_ENV=development
+    CMD ["python", "app.py"]
+    ```
+  </Step>
+  <Step title="final">
+    Copies application code and runs gunicorn with 4 worker processes. This is the production target.
+
+    ```dockerfile Dockerfile
+    FROM base AS final
+
+    COPY . .
+
+    EXPOSE 80
+
+    CMD ["gunicorn", "app:app", "-b", "0.0.0.0:80", "--log-file", "-", "--access-logfile", "-", "--workers", "4", "--keep-alive", "0"]
+    ```
+  </Step>
+</Steps>
+
+<Note>
+  The `docker-compose.yml` builds with `target: dev`, mounting the local `./vote` directory as a volume so code changes are reflected immediately without a rebuild.
+</Note>
+
+## Health check
+
+The compose file configures Docker to check the service is responding:
+
+```yaml docker-compose.yml
+healthcheck:
+  test: ["CMD", "curl", "-f", "http://localhost"]
+  interval: 15s
+  timeout: 5s
+  retries: 3
+  start_period: 10s
+```
+
+The worker service waits for both Redis and the database to be healthy before starting. The vote service only depends on Redis being healthy.

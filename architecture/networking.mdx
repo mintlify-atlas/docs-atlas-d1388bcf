@@ -1,0 +1,163 @@
+---
+title: Networking
+description: Docker network topology for the voting app across Docker Compose, Docker Swarm, and Kubernetes deployment modes.
+---
+
+The voting app uses explicit named networks to isolate services and control which containers can communicate with each other. The network design differs slightly between Docker Compose (local development), Docker Swarm (production), and Kubernetes.
+
+<Tabs>
+  <Tab title="Docker Compose">
+
+## Docker Compose networks
+
+The compose file defines two overlay-style bridge networks:
+
+```yaml
+networks:
+  front-tier:
+  back-tier:
+```
+
+### Network membership
+
+| Service | `front-tier` | `back-tier` | Rationale |
+|---------|:-----------:|:----------:|----------|
+| `vote` | yes | yes | Receives external HTTP traffic **and** must reach Redis |
+| `result` | yes | yes | Serves external HTTP traffic **and** must reach PostgreSQL |
+| `worker` | no | yes | Needs Redis and PostgreSQL, but has no user-facing interface |
+| `redis` | no | yes | Only consumed by worker; no reason to be reachable from the front tier |
+| `db` | no | yes | Only consumed by worker and result; no reason to be reachable from the front tier |
+
+### Why the worker doesn't need front-tier access
+
+The `worker` has no HTTP server and accepts no inbound connections from users or browsers. It only **initiates** outbound connections to `redis:6379` and `db:5432`, both of which are on `back-tier`. Placing it on `front-tier` would expand the attack surface without adding any capability.
+
+### Port mappings
+
+Only services on `front-tier` expose ports to the Docker host:
+
+| Service | Host port | Container port | Purpose |
+|---------|-----------|----------------|---------|
+| `vote` | `8080` | `80` | Ballot web UI |
+| `result` | `8081` | `80` | Live results web UI |
+| `result` | `127.0.0.1:9229` | `9229` | Node.js inspector (localhost only) |
+
+<Note>
+  The Node.js debug port `9229` is bound to `127.0.0.1` only, preventing it from being accessible on external network interfaces. Never expose port `9229` publicly.
+</Note>
+
+Services on `back-tier` only (`redis`, `db`, `worker`) have no host port mappings and are not reachable from outside the Docker network.
+
+  </Tab>
+  <Tab title="Docker Swarm">
+
+## Docker Swarm networks
+
+The `docker-stack.yml` file uses the older Compose v3 syntax and renames the networks to `frontend` and `backend` to align with Swarm conventions:
+
+```yaml
+networks:
+  frontend:
+  backend:
+```
+
+<Info>
+  The Swarm stack file cannot use the Compose Spec format because Docker Swarm does not support it. It is pinned to `version: "3.9"`.
+</Info>
+
+### Network membership in Swarm mode
+
+| Service | `frontend` | `backend` | Notes |
+|---------|:---------:|:--------:|------|
+| `vote` | yes | no | 2 replicas; ingress load-balances port `8080` across them |
+| `result` | no | yes | 1 replica; port `8081` exposed |
+| `worker` | yes | yes | 2 replicas; bridges the two networks |
+| `redis` | yes | no | Sits on `frontend` so the vote service and worker can reach it |
+| `db` | no | yes | Sits on `backend` so the worker and result can reach it |
+
+<Warning>
+  The Swarm network assignments differ from the Compose file — notably `redis` is on `frontend` and `result` is on `backend`. The worker bridges both. Double-check network membership when migrating between deployment modes.
+</Warning>
+
+### Replicas and routing
+
+```yaml
+vote:
+  deploy:
+    replicas: 2
+worker:
+  deploy:
+    replicas: 2
+```
+
+Docker Swarm's ingress routing mesh automatically distributes incoming connections across replicas. No explicit load balancer configuration is required.
+
+### Port mappings in Swarm mode
+
+| Service | Published port | Container port | Purpose |
+|---------|---------------|----------------|---------|
+| `vote` | `8080` | `80` | Ballot web UI (load-balanced across 2 replicas) |
+| `result` | `8081` | `80` | Live results web UI |
+
+  </Tab>
+  <Tab title="Kubernetes">
+
+## Kubernetes networking
+
+The `k8s-specifications/` directory contains Kubernetes `Deployment` and `Service` manifests for each component. Kubernetes networking replaces Docker named networks with cluster-DNS-based service discovery.
+
+### Service-to-service DNS resolution
+
+Each Kubernetes `Service` object creates a stable DNS name in the cluster. The application code uses hardcoded hostnames that match the service names:
+
+| Hostname used in code | Kubernetes Service name | Resolved by |
+|----------------------|------------------------|-------------|
+| `redis` | `redis` | `vote` app, `worker` |
+| `db` | `db` | `worker`, `result` |
+
+For example, the worker connects with:
+
+```csharp
+var pgsql = OpenDbConnection("Server=db;Username=postgres;Password=postgres;");
+var redisConn = OpenRedisConnection("redis");
+```
+
+And the result service uses:
+
+```javascript
+connectionString: 'postgres://postgres:postgres@db/postgres'
+```
+
+As long as the Kubernetes `Service` objects are named `redis` and `db`, no code changes are required.
+
+### NodePort services
+
+The `vote` and `result` services are exposed outside the cluster via `NodePort`:
+
+| Service | NodePort | Purpose |
+|---------|----------|--------|
+| `vote` | `31000` | Ballot UI, accessible on every cluster node |
+| `result` | `31001` | Results UI, accessible on every cluster node |
+
+To deploy:
+
+```bash
+kubectl create -f k8s-specifications/
+```
+
+To tear down:
+
+```bash
+kubectl delete -f k8s-specifications/
+```
+
+<Tip>
+  Resources are created in your current namespace (`default` unless changed). Use `kubectl config set-context --current --namespace=<name>` to deploy into a different namespace.
+</Tip>
+
+### Network isolation in Kubernetes
+
+By default, all pods in a namespace can communicate with each other. The demo app does not ship `NetworkPolicy` manifests. For production, add policies to restrict `redis` and `db` to only accept traffic from the services that need them.
+
+  </Tab>
+</Tabs>
