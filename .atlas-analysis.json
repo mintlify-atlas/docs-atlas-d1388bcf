@@ -1,0 +1,60 @@
+{
+  "projectType": "infrastructure",
+  "projectName": "Example Voting App",
+  "projectDescription": "A sample distributed application demonstrating multi-container Docker deployments with Python, Node.js, and .NET services, deployable via Docker Compose, Docker Swarm, or Kubernetes.",
+  "theme": "aspen",
+  "primaryColor": "#1c63ec",
+  "lightColor": "#8cb4f4",
+  "darkColor": "#04143c",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": ["introduction", "quickstart"]
+          },
+          {
+            "group": "Architecture",
+            "pages": ["architecture/overview", "architecture/services", "architecture/networking"]
+          },
+          {
+            "group": "Deployment",
+            "pages": ["deployment/docker-compose", "deployment/docker-swarm", "deployment/kubernetes"]
+          },
+          {
+            "group": "Services",
+            "pages": ["services/vote", "services/result", "services/worker", "services/redis", "services/postgres"]
+          },
+          {
+            "group": "Operations",
+            "pages": ["operations/configuration", "operations/healthchecks", "operations/seed-data", "operations/troubleshooting"]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Multi-container distributed application with 5 services",
+    "Deployable via Docker Compose for local development",
+    "Docker Swarm support with multiple replicas",
+    "Kubernetes deployment via YAML specifications",
+    "Real-time vote results via WebSockets (Socket.IO)",
+    "Polyglot stack: Python (Flask), Node.js, .NET (C#)",
+    "Redis message queue for vote buffering",
+    "PostgreSQL persistent storage for vote tallying",
+    "Multi-stage Docker builds for dev and production",
+    "Health checks for all dependent services"
+  ],
+  "publicApiSurface": [
+    "vote service — HTTP POST / (submit vote), HTTP GET / (view ballot) on port 8080",
+    "result service — HTTP GET / (view results), WebSocket scores event on port 8081",
+    "OPTION_A env var — customizes first voting option (default: Cats)",
+    "OPTION_B env var — customizes second voting option (default: Dogs)",
+    "docker compose up — start all services locally",
+    "docker stack deploy --compose-file docker-stack.yml vote — deploy to Swarm",
+    "kubectl create -f k8s-specifications/ — deploy to Kubernetes",
+    "docker compose --profile seed up -d — seed database with sample votes"
+  ]
+}
